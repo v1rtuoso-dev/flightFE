@@ -1,0 +1,225 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    outputs:
+      image_full: ${{ steps.set_tag.outputs.image_full }}
+      image_tag: ${{ steps.set_tag.outputs.image_tag }}
+
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏷️ Set image tag
+        id: set_tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]' | sed 's#[ _]#-#g' | sed 's/[^a-z0-9./-]/-/g')
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="manual-$(date +%Y%m%d-%H%M%S)"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            TAG="latest-$(date +%Y%m%d)"
+          else
+            TAG="${{ github.ref_name }}-$SHORT_SHA"
+            TAG=$(echo "$TAG" | tr '[:upper:]' '[:lower:]' | sed 's#[/ _]#-#g' | sed 's/[^a-z0-9.-]/-/g')
+          fi
+
+          IMAGE="${{ env.REGISTRY }}/$REPO:$TAG"
+          echo "image_full=$IMAGE" >> $GITHUB_OUTPUT
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+
+          if [[ "$TAG" == latest-* ]]; then
+            echo "IMAGE_TAGS=$IMAGE,${{ env.REGISTRY }}/$REPO:latest" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAGS=$IMAGE" >> $GITHUB_ENV
+          fi
+
+      - name: 🐳 Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_TAGS }}
+          build-args: |
+            VITE_BASE_API=${{ vars.VITE_BASE_API }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+
+    env:
+      SERVICE_NAME: ${{ vars.SERVICE_NAME || 'frontend' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 💾 Pull, save & compress image
+        run: |
+          echo "📥 Pulling image: ${{ needs.build-and-push.outputs.image_full }}"
+          docker pull "${{ needs.build-and-push.outputs.image_full }}"
+          docker save "${{ needs.build-and-push.outputs.image_full }}" | gzip > image.tar.gz
+
+      - name: 📤 Copy compressed image to VPS
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          source: 'image.tar.gz'
+          target: '${{ env.DEPLOY_PATH }}'
+
+      - name: Copy docker-compose.yml to VPS
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          source: 'docker-compose.yml'
+          target: '${{ env.DEPLOY_PATH }}'
+
+      - name: Deploy to VPS with validation & rollback
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            #!/bin/bash
+            set -e
+
+            DEPLOY_PATH="${{ env.DEPLOY_PATH }}"
+            SERVICE_NAME="${{ env.SERVICE_NAME }}"
+            NEW_IMAGE="${{ needs.build-and-push.outputs.image_full }}"
+
+            if [ ! -d "$DEPLOY_PATH" ]; then
+              echo "❌ DEPLOY_PATH does not exist: $DEPLOY_PATH"
+              exit 1
+            fi
+
+            cd "$DEPLOY_PATH"
+
+            # --- 1. Verify & load .env ---
+            if [ ! -f .env ]; then
+              echo "❌ .env not found! Please create it manually at $DEPLOY_PATH/.env"
+              exit 1
+            fi
+            export $(grep -v '^#' .env | xargs)
+            echo "✅ Environment variables loaded from .env"
+
+            # Load new image
+            echo "📦 Loading new image..."
+            gunzip -c image.tar.gz | docker load
+
+            # 🔍 Validation: run container for health check
+            echo "🧪 Validating image..."
+            CONTAINER_ID=$(docker run -d --rm --name temp-validate "$NEW_IMAGE")
+            sleep 3
+
+            if docker inspect -f '{{.State.Running}}' "$CONTAINER_ID" 2>/dev/null | grep -q 'true'; then
+              echo "✅ Validation passed."
+            else
+              echo "❌ Container failed to start."
+              docker logs "$CONTAINER_ID" 2>/dev/null || true
+              docker rm -f "$CONTAINER_ID" 2>/dev/null || true
+              exit 1
+            fi
+            docker kill "$CONTAINER_ID" >/dev/null 2>&1 || true
+
+            # 🔁 Capture current image for rollback
+            OLD_IMAGE=""
+            if docker compose ps -q | grep -q .; then
+              CURRENT_IMAGE_LINE=$(docker compose images "$SERVICE_NAME" 2>/dev/null | tail -n1)
+              OLD_IMAGE=$(echo "$CURRENT_IMAGE_LINE" | awk '{print $2}' | head -n1)
+              if [ -n "$OLD_IMAGE" ] && [ "$OLD_IMAGE" != "<none>" ]; then
+                echo "🔁 Saved rollback image: $OLD_IMAGE"
+              fi
+            else
+              echo "ℹ️ No running service — rollback not available."
+            fi
+
+            # --- 2. Update APP_IMAGE configuration ---
+            if grep -q '^APP_IMAGE=' .env; then
+              sed -i "s|^APP_IMAGE=.*|APP_IMAGE=$NEW_IMAGE|" .env
+            else
+              echo "APP_IMAGE=$NEW_IMAGE" >> .env
+            fi
+            export APP_IMAGE="$NEW_IMAGE"
+            echo "✅ Updated APP_IMAGE to: $NEW_IMAGE"
+
+            # 🚀 Deploy new version
+            echo "🚀 Deploying new version..."
+            docker compose down --remove-orphans || true
+
+            set +e
+            docker compose up -d --remove-orphans
+            DEPLOY_EXIT_CODE=$?
+            set -e
+
+            if [ $DEPLOY_EXIT_CODE -ne 0 ]; then
+              echo "❌ Deployment failed (exit code: $DEPLOY_EXIT_CODE)"
+              if [ -n "$OLD_IMAGE" ]; then
+                echo "🔄 Rolling back to: $OLD_IMAGE"
+                if grep -q '^APP_IMAGE=' .env; then
+                  sed -i "s|^APP_IMAGE=.*|APP_IMAGE=$OLD_IMAGE|" .env
+                else
+                  echo "APP_IMAGE=$OLD_IMAGE" >> .env
+                fi
+                export APP_IMAGE="$OLD_IMAGE"
+                docker compose up -d --remove-orphans
+                echo "✅ Rollback completed."
+              else
+                echo "⚠️ No rollback image available."
+              fi
+              exit $DEPLOY_EXIT_CODE
+            else
+              echo "✅ Deployment succeeded."
+              # 🧹 Cleanup old images (optional but recommended)
+              docker image prune -f
+            fi
+
+            # 🗑️ Final cleanup
+            rm -f image.tar.gz
+            echo "🎉 Deployment completed successfully."
